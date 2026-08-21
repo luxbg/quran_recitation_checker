@@ -1,0 +1,11 @@
+models/
+logs/
+.env
+*.onnx
+*.pt
+*.mlpackage
+tests/fixtures/audio/*.wav
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/

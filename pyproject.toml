@@ -1,0 +1,31 @@
+[project]
+name = "qrc"
+version = "0.1.0"
+description = "Streaming phoneme-level Quran recitation checker"
+requires-python = ">=3.10"
+dependencies = [
+    "sherpa-onnx",
+    "sounddevice",
+    "numpy",
+    "rapidfuzz",
+    "fuzzysearch",
+    "huggingface_hub",
+    "rich",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# Only needed to regenerate models/word_text_map.json (scripts/build_word_text_map.py),
+# never at runtime -- see that script's docstring.
+build = ["quran-transcript"]
+
+[project.scripts]
+qrc = "qrc.cli.main:app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

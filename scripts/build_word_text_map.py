@@ -41,7 +41,11 @@ live:
 Output: models/word_text_map.json, a list indexed by (original corpus)
 global_word_idx. Each entry is either null (couldn't be confidently
 mapped -- logged, not guessed at) or
-{"words": [{"text": ..., "phoneme_text": ...}, ...], "continues_previous": bool}.
+{"words": [{"text": ..., "phoneme_text": ..., "isolated_phoneme_text": ...}, ...], "continues_previous": bool}.
+"isolated_phoneme_text" is that word's own phonetic rendering computed on
+its own (see isolated_phonemes()) -- used by align/word_aligner.py to
+recover cross-word tajweed-liaison bleed and pause-dropped endings without
+needing any context from neighboring words.
 "words" has one entry per real written word this corpus unit resolves to
 (more than one only when the split in step 3 succeeded; otherwise a
 single entry whose "text" may still be multiple space-joined written
@@ -95,6 +99,23 @@ MOSHAF = qt.MoshafAttributes(
 
 def written_word_spans(text: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+
+
+def isolated_phonemes(written_word: str) -> str:
+    """This word's own phoneme rendering, phonetized on its own rather than
+    as part of the ayah -- quran_phonetizer applies waqf (pause) rules at
+    the end of whatever text it's given, so feeding it a single word
+    (nothing follows) naturally yields that word's standalone/paused
+    pronunciation: no liaison merge into a following word, and any
+    trailing tanween/short-vowel dropped the way a real pause would drop
+    it. Falls back to the word itself (rare phonetizer failure on a lone
+    word) rather than raising, since this is a secondary/optional field --
+    see align/word_aligner.py.
+    """
+    try:
+        return qt.quran_phonetizer(written_word, MOSHAF).phonemes.strip()
+    except Exception:
+        return written_word
 
 
 def qt_phoneme_groups(aya_text: str) -> list[str] | None:
@@ -227,6 +248,7 @@ def align_word_lists(corpus_words: list[str], qt_words: list[str]) -> list[list[
 class ResolvedWord:
     text: str
     phoneme_text: str
+    isolated_phoneme_text: str
 
 
 @dataclass
@@ -268,14 +290,19 @@ def build_written_word_text(
         prev_idxs = idxs
 
         if len(idxs) == 1:
-            words = [ResolvedWord(text=written[idxs[0]], phoneme_text=corpus_words[corpus_idx])]
+            text = written[idxs[0]]
+            words = [ResolvedWord(text=text, phoneme_text=corpus_words[corpus_idx], isolated_phoneme_text=isolated_phonemes(text))]
             result.append(WordTextMapEntry(words=words, continues_previous=continues_previous))
             continue
 
         split = split_merged_unit(corpus_words[corpus_idx], [qt_groups[i] for i in idxs])
         if split.spans is None or split.confidence < min_split_confidence:
             merged_text = " ".join(written[i] for i in idxs)
-            words = [ResolvedWord(text=merged_text, phoneme_text=corpus_words[corpus_idx])]
+            words = [
+                ResolvedWord(
+                    text=merged_text, phoneme_text=corpus_words[corpus_idx], isolated_phoneme_text=isolated_phonemes(merged_text)
+                )
+            ]
             result.append(
                 WordTextMapEntry(
                     words=words, continues_previous=continues_previous, split_confidence=split.confidence, split_succeeded=False
@@ -283,7 +310,10 @@ def build_written_word_text(
             )
         else:
             rebalanced_spans = rebalance_shared_gemination([written[i] for i in idxs], split.spans)
-            words = [ResolvedWord(text=written[i], phoneme_text=p) for i, p in zip(idxs, rebalanced_spans)]
+            words = [
+                ResolvedWord(text=written[i], phoneme_text=p, isolated_phoneme_text=isolated_phonemes(written[i]))
+                for i, p in zip(idxs, rebalanced_spans)
+            ]
             result.append(
                 WordTextMapEntry(
                     words=words, continues_previous=continues_previous, split_confidence=split.confidence, split_succeeded=True
@@ -330,7 +360,10 @@ def main() -> None:
                 continue
             gwi = first_global_idx + local_idx
             word_text_map[gwi] = {
-                "words": [{"text": w.text, "phoneme_text": w.phoneme_text} for w in item.words],
+                "words": [
+                    {"text": w.text, "phoneme_text": w.phoneme_text, "isolated_phoneme_text": w.isolated_phoneme_text}
+                    for w in item.words
+                ],
                 "continues_previous": item.continues_previous,
             }
             if item.split_succeeded is not None:

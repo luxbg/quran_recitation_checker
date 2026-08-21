@@ -7,10 +7,11 @@ from qrc.corpus.models import GlobalWordEntry
 class FakeCorpus:
     """Minimal stand-in exposing only what IncrementalWordAligner needs."""
 
-    def __init__(self, words: list[str]):
+    def __init__(self, words: list[str], isolated: list[str | None] | None = None):
+        isolated = isolated or [None] * len(words)
         self.entries = [
-            GlobalWordEntry(global_word_idx=i, surah=1, ayah=1, local_word_idx=i, phoneme_text=w)
-            for i, w in enumerate(words)
+            GlobalWordEntry(global_word_idx=i, surah=1, ayah=1, local_word_idx=i, phoneme_text=w, isolated_phoneme_text=iso)
+            for i, (w, iso) in enumerate(zip(words, isolated))
         ]
 
     def word_at(self, idx: int) -> GlobalWordEntry | None:
@@ -223,6 +224,59 @@ def test_merged_written_words_verify_independently():
     assert by_idx[2].status == "mismatch"
     assert by_idx[3].status == "match"
     assert by_idx[4].status == "match"
+
+
+def test_liaison_bleed_from_idgham_not_flagged_as_mismatch():
+    # Real case from a live session (2:8): the corpus's connected phoneme
+    # form for "مَن يَقُولُ" assumes obligatory idgham bighunna -- the noon
+    # of "مَن" merges into "يَقُولُ" (phoneme_text: "مَ" then "يييَقُۥۥلُ").
+    # The reciter instead pronounced "مَن" with its own noon clearly
+    # audible (correct on its own, just not merged forward), which left
+    # that noon attributed to "يَقُولُ"'s actual_phonemes instead
+    # ("نيَقُۥۥلُ") -- a false mismatch on a word actually recited
+    # correctly. Two feed_tokens calls, mirroring how the noon settles as
+    # part of "مَن" before "يَقُولُ"'s own audio arrives.
+    words = ["بسم", "الله", "مَ", "يييَقُۥۥلُ", "الرحيم"]
+    isolated = [None, None, "مَن", "يَقُۥۥل", None]
+    results = []
+    corpus = FakeCorpus(words, isolated)
+    settings = Settings(settle_lookahead_chars=0)
+    aligner = IncrementalWordAligner(corpus=corpus, settings=settings, on_word_result=results.append)
+    aligner.localize(0)
+
+    aligner.feed_tokens(tokens_for("".join(words[:2]) + "مَن"))
+    assert results[-1].word_index == 2
+    assert results[-1].status == "match"
+
+    aligner.feed_tokens(tokens_for("يَقُۥۥلُ" + words[4]))
+    aligner.flush()
+
+    by_idx = {r.word_index: r for r in results}
+    assert by_idx[3].status == "match"
+    assert by_idx[3].actual_phonemes == "يَقُۥۥلُ"
+    assert by_idx[4].status == "match"
+
+
+def test_word_recited_in_isolated_waqf_form_not_flagged_as_mismatch():
+    # A word paused on directly (its own trailing tanween/short-vowel
+    # dropped the way a real waqf drops it) doesn't match the corpus's
+    # connected-recitation phoneme_text, but is still a correct recitation
+    # of that word -- must match via its own isolated_phoneme_text.
+    words = ["بسم", "عَليمُن", "الرحيم"]
+    isolated = [None, "عَليم", None]
+    results = []
+    corpus = FakeCorpus(words, isolated)
+    settings = Settings(settle_lookahead_chars=0)
+    aligner = IncrementalWordAligner(corpus=corpus, settings=settings, on_word_result=results.append)
+    aligner.localize(0)
+
+    corrupted = [words[0], "عَليم", words[2]]
+    aligner.feed_tokens(tokens_for("".join(corrupted)))
+    aligner.flush()
+
+    by_idx = {r.word_index: r for r in results}
+    assert by_idx[1].status == "match"
+    assert by_idx[1].actual_phonemes == "عَليم"
 
 
 def test_flush_settles_trailing_skipped_word():

@@ -71,6 +71,13 @@ class IncrementalWordAligner:
     # (match/mismatch, not deleted) -- used to detect a repeated word
     # bleeding into the next one, see _strip_repeated_prefix.
     _last_settled_actual: str | None = None
+    # The isolated_phoneme_text of the last word settled as a genuine
+    # *match* (not mismatch/deleted) -- used to recover cross-word
+    # tajweed-liaison bleed into the next word, see _strip_liaison_bleed.
+    # None whenever the previous word wasn't a clean match: with no
+    # confirmed idea what was actually said, there's nothing trustworthy
+    # to attribute a leading bleed to.
+    _last_settled_isolated: str | None = None
 
     LOOKAHEAD_WORDS = 8
     _MIN_REPEAT_OVERLAP = 2
@@ -82,6 +89,7 @@ class IncrementalWordAligner:
         self.expected_buffer = ""
         self.rolling_similarity_ema = 1.0
         self._last_settled_actual = None
+        self._last_settled_isolated = None
         self._refill_expected()
 
     def _strip_repeated_prefix(self, actual: str) -> str:
@@ -101,6 +109,38 @@ class IncrementalWordAligner:
         max_overlap = min(len(self._last_settled_actual), len(actual))
         for length in range(max_overlap, self._MIN_REPEAT_OVERLAP - 1, -1):
             if self._last_settled_actual.endswith(actual[:length]):
+                return actual[length:]
+        return actual
+
+    def _strip_liaison_bleed(self, actual: str) -> str:
+        """A word recited in its own standalone (waqf) form -- rather than
+        the corpus's connected-recitation phoneme_text, which already
+        assumes obligatory tajweed liaison (idgham/ikhfa/iqlab) absorbed
+        some of its trailing content into the next word -- leaves that
+        extra trailing content attributed to the *next* word instead: the
+        DP has no notion of "this belongs to the word before", it just
+        sees unexplained leading characters and assigns them onward, same
+        root cause as _strip_repeated_prefix. Real case: "مَن" recited
+        with a clearly-pronounced ن (rather than the idgham-bighunna merge
+        into the following "يَقُولُ" that the corpus's connected form for
+        "مَن" assumes) left a leading ن attributed to "يَقُولُ"'s
+        actual_phonemes.
+
+        Strips the longest prefix of `actual` that's also a suffix of the
+        *previous settled word's own* isolated-pronunciation phonemes
+        (_last_settled_isolated -- already gated to only be set when that
+        word settled as a clean match, see its docstring). Unlike
+        _strip_repeated_prefix, a 1-char overlap is trusted here: this
+        isn't a coincidental content match against arbitrary preceding
+        text, it's a specific word's own known standalone pronunciation,
+        and the caller still requires the stripped result to exactly
+        match this word's own expected phonemes before adopting it.
+        """
+        if not self._last_settled_isolated or not actual:
+            return actual
+        max_overlap = min(len(self._last_settled_isolated), len(actual))
+        for length in range(max_overlap, 0, -1):
+            if self._last_settled_isolated.endswith(actual[:length]):
                 return actual[length:]
         return actual
 
@@ -186,33 +226,53 @@ class IncrementalWordAligner:
 
         actual_phonemes = "".join(actual_chars) or None
         expected_phonemes = first_word.entry.phoneme_text
+        isolated_phonemes = first_word.entry.isolated_phoneme_text
+        matched_isolated = False
 
-        # Repeat-prefix stripping is a *fallback for an otherwise-mismatched
-        # word*, never applied to content that already matches. Word
-        # boundaries in Arabic often coincidentally share phonemes (e.g.
-        # "...ءِ" ending one word, "ءِ..." starting the next -- hamza+kasra
-        # is common) -- stripping unconditionally turned a correct
-        # recitation into a false mismatch by cutting off genuine leading
-        # content that happened to resemble the previous word's ending.
-        # Only adopt the stripped version if it actually produces a match;
-        # if it doesn't help, report the real (unstripped) content instead
-        # of a partially-stripped guess.
         if actual_phonemes is not None and not phonemes_match(expected_phonemes, actual_phonemes):
-            stripped = self._strip_repeated_prefix(actual_phonemes)
-            if stripped != actual_phonemes and phonemes_match(expected_phonemes, stripped):
-                actual_phonemes = stripped or None
+            # A word recited with a brief pause right after it -- common in
+            # word-by-word practice recitation, not just a formal end-of-ayah
+            # waqf -- comes out in its own standalone pronunciation, which
+            # can differ from the corpus's connected-recitation phoneme_text
+            # wherever cross-word tajweed liaison (idgham/ikhfa/iqlab) or a
+            # pause-dropped tanween/short-vowel applies. Check that first:
+            # it's still the same word, correctly recited, just not in the
+            # form that assumes it flows straight into the next one.
+            if isolated_phonemes and phonemes_match(isolated_phonemes, actual_phonemes):
+                matched_isolated = True
+            else:
+                # Repeat-prefix stripping is a *fallback for an otherwise-
+                # mismatched word*, never applied to content that already
+                # matches. Word boundaries in Arabic often coincidentally
+                # share phonemes (e.g. "...ءِ" ending one word, "ءِ..."
+                # starting the next -- hamza+kasra is common) -- stripping
+                # unconditionally turned a correct recitation into a false
+                # mismatch by cutting off genuine leading content that
+                # happened to resemble the previous word's ending. Only
+                # adopt the stripped version if it actually produces a
+                # match; if it doesn't help, report the real (unstripped)
+                # content instead of a partially-stripped guess.
+                stripped = self._strip_repeated_prefix(actual_phonemes)
+                if stripped != actual_phonemes and phonemes_match(expected_phonemes, stripped):
+                    actual_phonemes = stripped or None
+                elif self._last_settled_isolated:
+                    bled = self._strip_liaison_bleed(actual_phonemes)
+                    if bled != actual_phonemes and phonemes_match(expected_phonemes, bled):
+                        actual_phonemes = bled or None
 
-        similarity = 0.0 if actual_phonemes is None else phoneme_similarity(expected_phonemes, actual_phonemes)
+        similarity_reference = isolated_phonemes if matched_isolated else expected_phonemes
+        similarity = 0.0 if actual_phonemes is None else phoneme_similarity(similarity_reference, actual_phonemes)
 
         if actual_phonemes is None:
             status: WordStatus = "deleted"
-        elif phonemes_match(expected_phonemes, actual_phonemes):
+        elif matched_isolated or phonemes_match(expected_phonemes, actual_phonemes):
             status = "match"
         else:
             status = "mismatch"
 
         if actual_phonemes is not None:
             self._last_settled_actual = actual_phonemes
+        self._last_settled_isolated = isolated_phonemes if status == "match" else None
 
         alpha = self.settings.relocalize_ema_alpha
         self.rolling_similarity_ema = alpha * similarity + (1 - alpha) * self.rolling_similarity_ema
@@ -283,6 +343,12 @@ class IncrementalWordAligner:
 
     def _emit_deleted_word(self) -> None:
         first_word = self.pending_words[0]
+        # A skipped word breaks the physical adjacency _strip_liaison_bleed
+        # relies on (it strips content bled from the *immediately*
+        # preceding word) -- nothing was actually recited here to bleed
+        # from, and re-using an older reference across the gap would be a
+        # guess, not a known-adjacent word's own pronunciation.
+        self._last_settled_isolated = None
         result = WordCheckResult(
             surah=first_word.entry.surah,
             ayah=first_word.entry.ayah,

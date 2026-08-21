@@ -87,6 +87,11 @@ def build_corpus(ordered_quran_phonemes_path: Path | str) -> QuranCorpus:
                         local_word_idx=local_idx,
                         phoneme_text=phoneme_text,
                         word_text=sub_word["text"],
+                        # .get, not [...]: absent from the fallback
+                        # (no-map) sub_word dict above, and from any
+                        # word_text_map.json written before this field
+                        # existed.
+                        isolated_phoneme_text=sub_word.get("isolated_phoneme_text"),
                         # Only the *first* row of a split unit carries the
                         # original entry's own continues_previous (a
                         # muqatta'at split, unrelated to this merge-split);

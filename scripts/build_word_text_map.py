@@ -28,21 +28,41 @@ live:
    (an occasional adjacent-word merge), not wholesale restructuring --
    also verified empirically before committing to this approach.
 
-Output: models/word_text_map.json, a list indexed by global_word_idx.
-Each entry is either null (couldn't be confidently mapped -- logged, not
-guessed at) or {"text": ..., "continues_previous": bool}. "text" is the
-real word text (possibly multiple written words joined by a space if
-merged). "continues_previous" is true when this corpus phoneme-word is
-part of the *same* real written word as the immediately preceding
-global_word_idx (a muqatta'at split, e.g. "الٓمٓ" spans two phoneme-word
-units both carrying continues_previous split across them) -- consumers
-must treat a continues_previous run as one logical word, not report each
-unit as if it were a separate word.
+3. Split: for a corpus phoneme-word that covers *multiple* written words
+   (the merge case), align/word_split.split_merged_unit does a further
+   character-level DP between the corpus word's own phoneme string and
+   the concatenation of its qt phoneme groups, to find the real split
+   points inside it -- so each written word gets its own phoneme
+   sub-span in the corpus's native convention (what the ASR was trained
+   on), not just a merged text label. Confidence-gated (MIN_SPLIT_
+   CONFIDENCE); below threshold, the unit is kept as one indivisible
+   entry rather than guessing wrong boundaries -- see REPORT_PATH.
+
+Output: models/word_text_map.json, a list indexed by (original corpus)
+global_word_idx. Each entry is either null (couldn't be confidently
+mapped -- logged, not guessed at) or
+{"words": [{"text": ..., "phoneme_text": ...}, ...], "continues_previous": bool}.
+"words" has one entry per real written word this corpus unit resolves to
+(more than one only when the split in step 3 succeeded; otherwise a
+single entry whose "text" may still be multiple space-joined written
+words, same as before that step existed). "continues_previous" is true
+when this corpus phoneme-word is part of the *same* real written word as
+the immediately preceding global_word_idx (a muqatta'at split, e.g.
+"الٓمٓ" spans two phoneme-word units both carrying continues_previous
+split across them) -- consumers must treat a continues_previous run as
+one logical word, not report each unit as if it were a separate word.
+
+models/word_text_map_overrides.json (optional, hand-maintained -- never
+generated) can supply manual fixes for ayahs the automated split
+couldn't resolve confidently: same per-entry shape as the main output,
+keyed by global_word_idx as a JSON string. Applied on top of the
+automated result on every run, so it survives regeneration.
 """
 
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import quran_transcript as qt
@@ -50,11 +70,18 @@ from rapidfuzz.distance import Levenshtein
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from qrc.corpus.index import build_corpus  # noqa: E402
+from qrc.corpus.loader import load_ayahs  # noqa: E402
+from qrc.corpus.word_split import rebalance_shared_gemination, split_merged_unit  # noqa: E402
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 CORPUS_PATH = MODELS_DIR / "ordered_quran_phonemes.json"
 OUTPUT_PATH = MODELS_DIR / "word_text_map.json"
+OVERRIDES_PATH = MODELS_DIR / "word_text_map_overrides.json"
+REPORT_PATH = MODELS_DIR / "word_split_report.json"
+
+# Picked empirically by inspecting the confidence-score distribution from
+# a full-corpus run (see REPORT_PATH) -- not guessed upfront.
+MIN_SPLIT_CONFIDENCE = 0.5
 
 MOSHAF = qt.MoshafAttributes(
     rewaya="hafs",
@@ -64,7 +91,6 @@ MOSHAF = qt.MoshafAttributes(
     madd_aared_len=2,
 )
 
-MATCH, DELETE_A, DELETE_B = 0, 1, 2  # DELETE_A: corpus word has no qt counterpart (split). DELETE_B: qt word has no corpus counterpart (merge).
 
 
 def written_word_spans(text: str) -> list[tuple[int, int]]:
@@ -93,6 +119,18 @@ def qt_phoneme_groups(aya_text: str) -> list[str] | None:
     return groups
 
 
+# No observed Tajweed liaison merge spans more than a handful of written
+# words (32:8's 5-word merge is the largest seen); capped generously so
+# the DP stays cheap without artificially limiting real merges.
+_MAX_QT_RUN = 8
+# Cost of leaving a qt word completely unattributed to any corpus word --
+# an escape valve for content that genuinely fits nowhere, not a normal
+# outcome. Must lose to any plausible multi-word run match (a run's
+# substitution cost is bounded by 1.0 per word it captures well; this is
+# set well above what several correctly-captured words would cost).
+_SKIP_PENALTY = 5.0
+
+
 def align_word_lists(corpus_words: list[str], qt_words: list[str]) -> list[list[int] | None]:
     """Word-level edit-distance alignment (not char-level -- these are
     two different phoneme-word segmentations of the same ayah). Returns,
@@ -101,61 +139,72 @@ def align_word_lists(corpus_words: list[str], qt_words: list[str]) -> list[list[
     for the phoneme text as a substring elsewhere: short/common phoneme
     groups like "لَا" false-match inside many unrelated groups, which is
     exactly what corrupted longer ayahs like 2:255 before this was an
-    index-based return). Substitution cost is fractional (1 -
-    similarity), not 0/1, since these are two different renderings of
-    generally-the-same content, not independent random text.
+    index-based return).
+
+    Each corpus word is matched against a *run* of one or more consecutive
+    qt words (substitution cost = 1 - similarity of the corpus word
+    against the run's concatenation), and the DP picks whichever run
+    length best explains that corpus word's actual phoneme content. This
+    is deliberately not "match 1 qt word, then glue any leftover qt words
+    onto whichever corpus word happens to follow": that forward-only
+    gluing is directionally biased and got the *wrong* written word
+    attached when a merge's extra phonetic content bleeds backward into
+    the *previous* corpus word instead (found via 2:12: "لَّا"'s phonemes
+    are actually a suffix of "وَلَـٰكِن"'s corpus unit, but forward-gluing
+    attached "لَّا" to the next corpus unit, "يَشْعُرُونَ", where its
+    phonemes don't appear at all). Letting the run itself carry the
+    match means the alignment is chosen by which grouping actually fits
+    the content, not by which side of a word it happened to be glued to.
+
+    A corpus word with no qt counterpart at all (DELETE_A -- a muqatta'at
+    split, one written word spanning several corpus units) still costs a
+    flat 1.0 and is filled from a neighbor below. A qt word matching no
+    corpus word (SKIP) is a heavily-penalized escape valve, not an
+    expected outcome.
     """
     n, m = len(corpus_words), len(qt_words)
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    bp = [[MATCH] * (m + 1) for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        dp[i][0] = i
-        bp[i][0] = DELETE_A
+    # bp[i][j] = (prev_i, prev_j, op, run_len) where op is "RUN",
+    # "DELETE_A", or "SKIP"; run_len is only meaningful for "RUN".
+    bp: list[list[tuple[int, int, str, int | None]]] = [[(0, 0, "SKIP", None)] * (m + 1) for _ in range(n + 1)]
+
     for j in range(1, m + 1):
-        dp[0][j] = j
-        bp[0][j] = DELETE_B
+        dp[0][j] = dp[0][j - 1] + _SKIP_PENALTY
+        bp[0][j] = (0, j - 1, "SKIP", None)
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + 1.0
+        bp[i][0] = (i - 1, 0, "DELETE_A", None)
 
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            sub_cost = 1.0 - Levenshtein.normalized_similarity(corpus_words[i - 1], qt_words[j - 1])
-            diag = dp[i - 1][j - 1] + sub_cost
-            up = dp[i - 1][j] + 1.0
-            left = dp[i][j - 1] + 1.0
-            best, op = diag, MATCH
-            if up < best:
-                best, op = up, DELETE_A
-            if left < best:
-                best, op = left, DELETE_B
-            dp[i][j], bp[i][j] = best, op
+            best_cost = dp[i][j - 1] + _SKIP_PENALTY
+            best_bp: tuple[int, int, str, int | None] = (i, j - 1, "SKIP", None)
 
-    # Traceback, grouping consecutive DELETE_B (qt-only, merge case) qt-words
-    # onto the next MATCH's corpus word; a DELETE_A (corpus-only, split
-    # case) corpus word borrows its neighbor's qt group as a fallback.
-    path: list[tuple[int | None, int | None, int]] = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        op = bp[i][j]
-        if op == MATCH:
-            path.append((i - 1, j - 1, MATCH))
-            i, j = i - 1, j - 1
-        elif op == DELETE_A:
-            path.append((i - 1, None, DELETE_A))
-            i -= 1
-        else:
-            path.append((None, j - 1, DELETE_B))
-            j -= 1
-    path.reverse()
+            delete_a_cost = dp[i - 1][j] + 1.0
+            if delete_a_cost < best_cost:
+                best_cost, best_bp = delete_a_cost, (i - 1, j, "DELETE_A", None)
+
+            concat = ""
+            for k in range(1, min(_MAX_QT_RUN, j) + 1):
+                concat = qt_words[j - k] + concat
+                sub_cost = 1.0 - Levenshtein.normalized_similarity(corpus_words[i - 1], concat)
+                run_cost = dp[i - 1][j - k] + sub_cost
+                if run_cost < best_cost:
+                    best_cost, best_bp = run_cost, (i - 1, j - k, "RUN", k)
+
+            dp[i][j] = best_cost
+            bp[i][j] = best_bp
 
     result: list[list[int] | None] = [None] * n
-    pending_qt: list[int] = []
-    for a_idx, b_idx, op in path:
-        if op == MATCH:
-            result[a_idx] = pending_qt + [b_idx]
-            pending_qt = []
-        elif op == DELETE_B:
-            pending_qt.append(b_idx)
-        else:  # DELETE_A: corpus word with no qt counterpart -- borrow a neighbor
-            result[a_idx] = None  # filled in from a neighbor below
+    i, j = n, m
+    while i > 0 or j > 0:
+        prev_i, prev_j, op, k = bp[i][j]
+        if op == "RUN":
+            result[i - 1] = list(range(j - k, j))
+        elif op == "DELETE_A":
+            result[i - 1] = None  # filled in from a neighbor below
+        # SKIP contributes to no corpus word.
+        i, j = prev_i, prev_j
 
     # Fill DELETE_A gaps from the nearest resolved neighbor (muqatta'at
     # splits: one written word maps to several corpus phoneme-words).
@@ -174,67 +223,147 @@ def align_word_lists(corpus_words: list[str], qt_words: list[str]) -> list[list[
     return result
 
 
-def build_written_word_text(aya_text: str, corpus_words: list[str], qt_groups: list[str]) -> list[tuple[str, bool] | None]:
+@dataclass
+class ResolvedWord:
+    text: str
+    phoneme_text: str
+
+
+@dataclass
+class WordTextMapEntry:
+    words: list[ResolvedWord]
+    continues_previous: bool
+    # None unless this slot was a genuine multi-word merge -- present so
+    # main() can report split outcomes without recomputing them.
+    split_confidence: float | None = None
+    split_succeeded: bool | None = None
+
+
+def build_written_word_text(
+    aya_text: str, corpus_words: list[str], qt_groups: list[str], min_split_confidence: float
+) -> list[WordTextMapEntry | None]:
     """Map each corpus phoneme-word back to the real written word(s) it
     corresponds to, by aligning corpus_words<->qt_groups (fuzzy, by index
     -- not by re-deriving indices via substring search, which false-
     matches on short/common phoneme groups like "لَا" appearing inside
     many unrelated groups) and qt_groups<->written_words (exact,
-    positional, same list by construction).
+    positional, same list by construction). For a multi-word merge,
+    attempts a further character-level split (word_split.split_merged_unit)
+    to recover each real word's own phoneme sub-span; falls back to a
+    single merged entry (as before that step existed) if the split isn't
+    confident.
     """
     written = [aya_text[s:e] for s, e in written_word_spans(aya_text)]
     aligned_indices = align_word_lists(corpus_words, qt_groups)
 
-    # (text, continues_previous). continues_previous=True means this
-    # corpus word is part of the *same* real written word as the one
-    # immediately before it (a muqatta'at split, e.g. "الٓمٓ" spanning two
-    # phoneme-word units) -- the caller must treat these as one logical
-    # word, not report/log each unit separately.
-    result: list[tuple[str, bool] | None] = []
+    result: list[WordTextMapEntry | None] = []
     prev_idxs: list[int] | None = None
-    for idxs in aligned_indices:
+    for corpus_idx, idxs in enumerate(aligned_indices):
         if idxs is None:
             result.append(None)
             prev_idxs = None
             continue
+
         continues_previous = idxs == prev_idxs
-        result.append((" ".join(written[i] for i in idxs), continues_previous))
         prev_idxs = idxs
+
+        if len(idxs) == 1:
+            words = [ResolvedWord(text=written[idxs[0]], phoneme_text=corpus_words[corpus_idx])]
+            result.append(WordTextMapEntry(words=words, continues_previous=continues_previous))
+            continue
+
+        split = split_merged_unit(corpus_words[corpus_idx], [qt_groups[i] for i in idxs])
+        if split.spans is None or split.confidence < min_split_confidence:
+            merged_text = " ".join(written[i] for i in idxs)
+            words = [ResolvedWord(text=merged_text, phoneme_text=corpus_words[corpus_idx])]
+            result.append(
+                WordTextMapEntry(
+                    words=words, continues_previous=continues_previous, split_confidence=split.confidence, split_succeeded=False
+                )
+            )
+        else:
+            rebalanced_spans = rebalance_shared_gemination([written[i] for i in idxs], split.spans)
+            words = [ResolvedWord(text=written[i], phoneme_text=p) for i, p in zip(idxs, rebalanced_spans)]
+            result.append(
+                WordTextMapEntry(
+                    words=words, continues_previous=continues_previous, split_confidence=split.confidence, split_succeeded=True
+                )
+            )
     return result
 
 
-def main() -> None:
-    corpus = build_corpus(CORPUS_PATH)
+def _load_overrides() -> dict[int, dict]:
+    if not OVERRIDES_PATH.exists():
+        return {}
+    with open(OVERRIDES_PATH, encoding="utf-8") as f:
+        raw: dict[str, dict] = json.load(f)
+    return {int(k): v for k, v in raw.items()}
 
-    word_text_map: list[dict | None] = [None] * len(corpus.global_words)
+
+def main() -> None:
+    ayahs = load_ayahs(CORPUS_PATH)
+    overrides = _load_overrides()
+
+    total_words = sum(len(a.words) for a in ayahs)
+    word_text_map: list[dict | None] = [None] * total_words
     failed_ayahs: list[str] = []
     unmapped_words = 0
+    merges_attempted = 0
+    merges_split = 0
+    fallback_report: list[dict] = []
 
-    for ayah_idx, entry in enumerate(corpus.ayahs_in_order):
+    global_idx = 0
+    for ayah_idx, entry in enumerate(ayahs):
+        first_global_idx = global_idx
+        global_idx += len(entry.words)
+
         qt_groups = qt_phoneme_groups(entry.aya_text)
         if qt_groups is None:
             failed_ayahs.append(f"{entry.ref.surah}:{entry.ref.ayah}")
             continue
 
-        written_texts = build_written_word_text(entry.aya_text, list(entry.words), qt_groups)
+        written_texts = build_written_word_text(entry.aya_text, list(entry.words), qt_groups, MIN_SPLIT_CONFIDENCE)
 
-        first_global_idx = next(
-            w.global_word_idx for w in corpus.global_words if w.surah == entry.ref.surah and w.ayah == entry.ref.ayah and w.local_word_idx == 0
-        )
         for local_idx, item in enumerate(written_texts):
             if item is None:
                 unmapped_words += 1
                 continue
-            text, continues_previous = item
-            word_text_map[first_global_idx + local_idx] = {"text": text, "continues_previous": continues_previous}
+            gwi = first_global_idx + local_idx
+            word_text_map[gwi] = {
+                "words": [{"text": w.text, "phoneme_text": w.phoneme_text} for w in item.words],
+                "continues_previous": item.continues_previous,
+            }
+            if item.split_succeeded is not None:
+                merges_attempted += 1
+                if item.split_succeeded:
+                    merges_split += 1
+                else:
+                    fallback_report.append(
+                        {
+                            "surah": entry.ref.surah,
+                            "ayah": entry.ref.ayah,
+                            "local_word_idx": local_idx,
+                            "global_word_idx": gwi,
+                            "written_words": item.words[0].text,
+                            "confidence": item.split_confidence,
+                        }
+                    )
 
         if (ayah_idx + 1) % 1000 == 0:
-            print(f"  {ayah_idx + 1}/{len(corpus.ayahs_in_order)} ayahs...", file=sys.stderr)
+            print(f"  {ayah_idx + 1}/{len(ayahs)} ayahs...", file=sys.stderr)
+
+    for gwi, override in overrides.items():
+        word_text_map[gwi] = override
 
     OUTPUT_PATH.write_text(json.dumps(word_text_map, ensure_ascii=False))
+    REPORT_PATH.write_text(json.dumps(fallback_report, ensure_ascii=False, indent=2))
+
     print(f"Wrote {OUTPUT_PATH}")
+    print(f"Wrote {REPORT_PATH} ({len(fallback_report)} unresolved merges)")
+    print(f"Applied {len(overrides)} manual override(s) from {OVERRIDES_PATH}")
     print(f"Failed ayahs (phonetizer crashed): {len(failed_ayahs)} -- {failed_ayahs[:20]}")
     print(f"Unmapped words: {unmapped_words} / {len(word_text_map)} ({100 * unmapped_words / len(word_text_map):.2f}%)")
+    print(f"Merges attempted: {merges_attempted}, split successfully: {merges_split} ({100 * merges_split / max(merges_attempted, 1):.1f}%)")
 
 
 if __name__ == "__main__":

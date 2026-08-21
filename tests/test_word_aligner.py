@@ -202,6 +202,29 @@ def test_coincidental_word_boundary_overlap_not_treated_as_a_repeat():
     assert by_idx[2].actual_phonemes == "ءِلَ"
 
 
+def test_merged_written_words_verify_independently():
+    # Regression for the reported UX bug: a Tajweed-liaison-merged corpus
+    # phoneme-word (here modeling 32:8's real 5-word merge) must now
+    # settle as 5 independent words, not one indivisible blob -- a
+    # mismatch in one of the real words must not fail the others.
+    words = ["مِںںں", "سُلَاالَتِ", "ممممِ", "ممممَااااءِ", "ممممَهِۦۦۦۦن"]
+    results = []
+    aligner = make_aligner(words, results)
+
+    corrupted = list(words)
+    corrupted[2] = "ططططِ"  # wrong word recited in place of the 3rd real word
+    aligner.feed_tokens(tokens_for("".join(corrupted)))
+    aligner.flush()
+
+    assert len(results) == 5
+    by_idx = {r.word_index: r for r in results}
+    assert by_idx[0].status == "match"
+    assert by_idx[1].status == "match"
+    assert by_idx[2].status == "mismatch"
+    assert by_idx[3].status == "match"
+    assert by_idx[4].status == "match"
+
+
 def test_flush_settles_trailing_skipped_word():
     words = ["بسم", "الله", "الرحمن", "الرحيم"]
     results = []

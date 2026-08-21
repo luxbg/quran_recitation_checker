@@ -48,25 +48,58 @@ def build_corpus(ordered_quran_phonemes_path: Path | str) -> QuranCorpus:
     char_offsets: list[int] = []
     cursor = 0
 
-    for ayah in ayahs:
-        for local_idx, word_phonemes in enumerate(ayah.words):
-            gwi = len(global_words)
-            entry = word_text_map[gwi] if word_text_map is not None else None
-            global_words.append(
-                GlobalWordEntry(
-                    global_word_idx=gwi,
-                    surah=ayah.ref.surah,
-                    ayah=ayah.ref.ayah,
-                    local_word_idx=local_idx,
-                    phoneme_text=word_phonemes,
-                    word_text=entry["text"] if entry is not None else None,
-                    word_text_continues_previous=entry["continues_previous"] if entry is not None else False,
-                )
-            )
+    # scripts/build_word_text_map.py indexes its output by *original*
+    # corpus phoneme-word position (one slot per ayah.words entry, counted
+    # in the same ayahs-in-order / within-ayah traversal as here) -- not
+    # by global_word_idx, which below is reassigned fresh per real written
+    # word and shifts as soon as any earlier ayah in the Quran contains a
+    # split. Track that original position with its own counter rather
+    # than re-deriving it per word (which would be O(n) per lookup).
+    original_gwi = 0
 
-            char_offsets.append(cursor)
-            corpus_parts.append(word_phonemes)
-            cursor += len(word_phonemes)
+    for ayah in ayahs:
+        local_idx = 0
+        for word_phonemes in ayah.words:
+            entry = word_text_map[original_gwi] if word_text_map is not None else None
+            original_gwi += 1
+
+            # Tajweed liaison merges some written words into one phoneme
+            # unit (see build_word_text_map.py's module docstring); where
+            # that offline precompute confidently split it back into its
+            # real per-word phoneme sub-spans ("words" has more than one
+            # entry), explode it into that many GlobalWordEntry rows here
+            # instead of one -- so the aligner verifies each real written
+            # word independently. Where it didn't split (single-element
+            # "words", or no map at all), this is exactly today's
+            # behavior: one row, using the corpus's own merged phoneme
+            # text.
+            sub_words = entry["words"] if entry is not None else [{"text": None, "phoneme_text": word_phonemes}]
+            continues_previous = entry["continues_previous"] if entry is not None else False
+
+            for sub_idx, sub_word in enumerate(sub_words):
+                gwi = len(global_words)
+                phoneme_text = sub_word["phoneme_text"]
+                global_words.append(
+                    GlobalWordEntry(
+                        global_word_idx=gwi,
+                        surah=ayah.ref.surah,
+                        ayah=ayah.ref.ayah,
+                        local_word_idx=local_idx,
+                        phoneme_text=phoneme_text,
+                        word_text=sub_word["text"],
+                        # Only the *first* row of a split unit carries the
+                        # original entry's own continues_previous (a
+                        # muqatta'at split, unrelated to this merge-split);
+                        # every row after the first, within the same
+                        # original unit, is a fresh real word, not a
+                        # continuation of the row before it.
+                        word_text_continues_previous=continues_previous if sub_idx == 0 else False,
+                    )
+                )
+                char_offsets.append(cursor)
+                corpus_parts.append(phoneme_text)
+                cursor += len(phoneme_text)
+                local_idx += 1
 
     corpus_text = "".join(corpus_parts)
 
